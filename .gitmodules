@@ -1,0 +1,3 @@
+[submodule "ccresearchproxy.du"]
+	path = ccresearchproxy.du
+	url = https://github.com/juanantonio/bossanova.git

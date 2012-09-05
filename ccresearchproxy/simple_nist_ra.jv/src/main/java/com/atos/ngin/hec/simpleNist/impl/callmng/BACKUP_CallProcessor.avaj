@@ -1,0 +1,820 @@
+package com.atos.ngin.hec.simpleNist.impl.callmng;
+
+import gov.nist.javax.sip.header.Via;
+import gov.nist.javax.sip.header.ViaList;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.text.ParseException;
+import java.util.ListIterator;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicLong;
+
+import javax.management.NotCompliantMBeanException;
+import javax.sip.ClientTransaction;
+import javax.sip.Dialog;
+import javax.sip.DialogTerminatedEvent;
+import javax.sip.IOExceptionEvent;
+import javax.sip.InvalidArgumentException;
+import javax.sip.ListeningPoint;
+import javax.sip.ObjectInUseException;
+import javax.sip.RequestEvent;
+import javax.sip.ResponseEvent;
+import javax.sip.ServerTransaction;
+import javax.sip.SipException;
+import javax.sip.SipFactory;
+import javax.sip.SipListener;
+import javax.sip.SipProvider;
+import javax.sip.SipStack;
+import javax.sip.Timeout;
+import javax.sip.TimeoutEvent;
+import javax.sip.TransactionTerminatedEvent;
+import javax.sip.TransactionUnavailableException;
+import javax.sip.address.Address;
+import javax.sip.address.AddressFactory;
+import javax.sip.address.SipURI;
+import javax.sip.header.CallIdHeader;
+import javax.sip.header.ContactHeader;
+import javax.sip.header.HeaderFactory;
+import javax.sip.message.Message;
+import javax.sip.message.MessageFactory;
+import javax.sip.message.Request;
+import javax.sip.message.Response;
+import javax.slee.SLEEException;
+import javax.slee.resource.ActivityAlreadyExistsException;
+import javax.slee.resource.ActivityHandle;
+import javax.slee.resource.EventFlags;
+import javax.slee.resource.FireEventException;
+import javax.slee.resource.SleeEndpoint;
+import javax.slee.resource.StartActivityException;
+
+import org.apache.log4j.Logger;
+import org.apache.log4j.Priority;
+
+import com.atos.ngin.hec.simpleNist.event.IncomingCallEvent;
+import com.atos.ngin.hec.simpleNist.impl.SimpleNISTResourceAdaptor;
+import com.atos.ngin.hec.simpleNist.impl.SimpleNistProcessor;
+import com.atos.ngin.hec.simpleNist.impl.callmng.CallProcessorStats.MessageStats.MessageCounter;
+import com.atos.ngin.hec.simpleNist.type.CallActivity;
+import com.atos.ngin.hec.simpleNist.type.CallLeg;
+
+public class CallProcessor implements SipListener, SimpleNistProcessor
+{
+	SimpleNISTResourceAdaptor ra; 
+	
+	//Stack resources
+	protected AddressFactory addressFactory;
+	protected MessageFactory messageFactory;
+	protected HeaderFactory headerFactory;
+	protected SipProvider sipProvider;	
+	
+	private SipStack sipStack;
+	public int stackPort    = 5060;
+	private String stackAddress = "localhost";
+	private String stackUri = stackAddress + ":" + stackPort;
+	private String stackRoute = null;
+	private String stackTransport = "udp";
+
+	private ListeningPoint lp = null;	
+	private int stackThreads = 10;
+	private int stackTraceLevel = 0;
+	private String stackDebugLog = "spe2debug.txt";
+	private String stackServerLog = "spe2log.txt";
+	private String stackPathName = "gov.nist";	
+	private boolean terminationRequested = false;	
+	
+	public static int CL_MAP_INITIAL_CAPACITY = 100000;
+	public static int CALL_MAP_INITIAL_CAPACITY = 50000;
+	public static int QUEUE_INITIAL_CAPACITY = 10000;
+
+	private Logger logger = null; 
+	private ConcurrentHashMap<String, CallLegImpl> callLegs = new ConcurrentHashMap<String, CallLegImpl>(100000);
+	private ConcurrentHashMap<String, CallActivityImpl> calls = new ConcurrentHashMap<String, CallActivityImpl>(100000);
+	private LinkedBlockingQueue<String> serviceActionQueue = new LinkedBlockingQueue<String>(QUEUE_INITIAL_CAPACITY);
+	private LinkedBlockingQueue<String> callEventProcessQueue = new LinkedBlockingQueue<String>(QUEUE_INITIAL_CAPACITY);
+	//	public static int MIN_NUM_OF_EXECUTORS = 10;
+	//	public static int MAX_NUM_OF_EXECUTORS = 100;	
+	//	private ThreadPoolExecutor threadPool = new ThreadPoolExecutor(MIN_NUM_OF_EXECUTORS, MAX_NUM_OF_EXECUTORS, 10, TimeUnit.SECONDS);
+	
+	private ContactHeader stackContactHeader;
+	private CallProcessorStats callProcessorStats;
+	/**
+	 * 
+	 * @param ra
+	 */
+	public CallProcessor (SimpleNISTResourceAdaptor ra)
+	{
+		this.ra = ra;
+		logger = Logger.getLogger(ra.getRaContext().getEntityName()+".CallProcessor");
+		try
+		{
+			callProcessorStats = new CallProcessorStats((SimpleNistProcessor)this);
+			logger.error("Call Processor Statistics MBean created");			    		
+		} catch (NotCompliantMBeanException e)
+		{
+			// TODO Auto-generated catch block
+			logger.error("Could not create MBean for the Call Processor");
+			e.printStackTrace();
+		}
+	}
+	public CallProcessorStats getCallProcessorStats()
+	{
+		return callProcessorStats;
+	}
+	/**
+	 * 
+	 * @param message
+	 * @return
+	 */
+	public boolean enqueueServiceAction (String message)
+	{   
+	  if(!terminationRequested)
+	  {
+	    boolean enqueued = serviceActionQueue.offer(message);
+	    if(logger.isDebugEnabled())logger.debug("Enqueuing message "+message);
+	    if(logger.isDebugEnabled())logger.debug("Queue size: "+serviceActionQueue.size());
+	    return enqueued;
+	  }
+	  else
+	  {
+		if(logger.isDebugEnabled())logger.debug("Trying to enqueue an element once the writer is stopping");
+	    return false;
+	  }
+	}
+	/**
+	 * 
+	 * @param message
+	 * @return
+	 */
+	public boolean enqueueCallProcessEvent (String message)
+	{   
+	  if(!terminationRequested)
+	  {
+	    boolean enqueued = callEventProcessQueue.offer(message);
+	    if(logger.isDebugEnabled())logger.debug("Enqueuing message "+message);
+	    if(logger.isDebugEnabled())logger.debug("Queue size: "+serviceActionQueue.size());
+	    return enqueued;
+	  }
+	  else
+	  {
+		if(logger.isDebugEnabled())logger.debug("Trying to enqueue an element once the writer is stopping");
+	    return false;
+	  }
+	}	
+	
+	/**
+	 * 
+	 * @return
+	 */
+	public int getCPEOccupancy()
+	{
+		return callEventProcessQueue.size();
+	}
+	/**
+	 * 
+	 * @return
+	 */
+	public int getSAOccupancy()
+	{
+		return serviceActionQueue.size();
+	}	
+
+	
+	/**
+	 * Process IOException
+	 * 
+	 * @param exceptionEvent
+	 *            Exception Event
+	 */
+	public void processIOException(IOExceptionEvent exceptionEvent)
+	{
+		callProcessorStats.getCounters().incrementCounter(MessageCounter.IOEXCEPTION);
+		logger.error("IOException " + exceptionEvent + " received at "
+				+ sipStack.getStackName());
+		//TODO
+	}
+	
+	/**
+	 * Process Transaction Terminated
+	 * 
+	 * @param transactionTerminatedEvent
+	 *            Transaction Terminated Event
+	 */
+	public void processTransactionTerminated(TransactionTerminatedEvent 
+            transactionTerminatedEvent)
+	{
+		//TODO
+		callProcessorStats.getCounters().incrementCounter(MessageCounter.TRANSACION_TERMINATED);
+		if (transactionTerminatedEvent.getClientTransaction() != null)
+			if (logger.isDebugEnabled())logger.debug("Client TransactionTerminated " + transactionTerminatedEvent.getClientTransaction().getDialog().getCallId().getCallId() + " received at "
+				+ sipStack.getStackName());
+		else
+			if (logger.isDebugEnabled())logger.debug("Server TransactionTerminated " + transactionTerminatedEvent.getServerTransaction().getDialog().getCallId().getCallId() + " received at "
+					+ sipStack.getStackName());
+	}
+
+	/**
+	 * Process Dialog Terminated
+	 * 
+	 * @param dialogTerminatedEvent
+	 *            Dialog Terminated Event
+	 */
+	public void processDialogTerminated(DialogTerminatedEvent 
+            dialogTerminatedEvent)
+	{
+		callProcessorStats.getCounters().incrementCounter(MessageCounter.DIALOG_TERMINATED);
+		if (logger.isDebugEnabled())logger.debug("DialogTerminated " + dialogTerminatedEvent.getDialog().getCallId().getCallId() + " received at "
+				+ sipStack.getStackName());
+		
+	}
+	
+	/**
+	 * 
+	 */
+	public void processRequest(RequestEvent requestEvent)
+	{
+		if (logger.isDebugEnabled())
+			logger.debug("Request " + requestEvent.getRequest() + " received at "
+					+ sipStack.getStackName() + " with server transaction id "
+					+ requestEvent.getServerTransaction());
+		
+		Dialog dialog = requestEvent.getDialog();
+		Request request = requestEvent.getRequest();
+		ServerTransaction serverTransaction = requestEvent.getServerTransaction();
+		requestEvent.getSource(); //javax.sip.SipProvider
+		if(logger.isDebugEnabled())logger.debug("CP:notifyRqEvt-ST: "+requestEvent.getServerTransaction());
+		if(logger.isDebugEnabled())logger.debug("CP:notifyRqEvt-SRC: "+requestEvent.getSource());
+		if(logger.isDebugEnabled())logger.debug("CP:notifyRqEvt-DLG: "+dialog);
+		if ( (serverTransaction == null) && (request.getMethod().equals(Request.INVITE)) ) 
+		//		if ( (serverTransaction == null) && !request.getMethod().equals(Request.ACK) )
+		{
+			try {
+				SipProvider sipProvider = (SipProvider) requestEvent.getSource();
+				serverTransaction = sipProvider
+						.getNewServerTransaction(request);
+				if(logger.isDebugEnabled())logger.debug("CP:notifyRqEvt: Created ST: "+serverTransaction);
+				Dialog dialog_ = serverTransaction.getDialog();
+				if (dialog_ != null)
+				{
+					dialog = dialog_;
+					if(logger.isDebugEnabled())logger.debug("CP:notifyRqEvt: DLG after Tx creation: "+dialog);
+					//					dialog.terminateOnBye(true);
+				}
+				
+			} catch (Exception ex) {
+				logger.warn("Probably transaction already exists=" + ex);
+				//ex.printStackTrace();
+			}
+			// Check re-INVITE: it seems there is no chance of a reINVITE here...
+			String rqCallId = getCallId(request,null);
+			if (rqCallId == null)
+			{
+				logger.warn("Null callId in the request: "+request);
+			}
+			CallLegImpl rqCallLeg = callLegs.get(rqCallId);
+			if (rqCallLeg == null)
+			{				
+
+				callProcessorStats.getCounters().incrementCounter(MessageCounter.FIRST_INVITE);
+				CallLegImpl incomingCallLeg = new CallLegImpl(rqCallId, serverTransaction, ra);
+				callLegs.put(rqCallId, incomingCallLeg);
+				CallActivityImpl callActivity = new CallActivityImpl(rqCallId, incomingCallLeg, ra, this);
+				incomingCallLeg.setCallActivity(callActivity);
+				CallActivityHandle callActivityHandle = callActivity.getActivityHandle();				
+				try
+				{
+					SleeEndpoint endpoint = ra.getEndpoint();
+					endpoint.startActivity(callActivityHandle, callActivity);
+					calls.put(callActivityHandle.toString(), callActivity);
+					IncomingCallEvent incomingCallEvent = new IncomingCallEvent(request/*, callActivity*/);
+					endpoint.fireEvent(callActivityHandle, ra.incomingCallEvent, incomingCallEvent, null, null, EventFlags.REQUEST_PROCESSING_SUCCESSFUL_CALLBACK | 
+						      EventFlags.REQUEST_PROCESSING_FAILED_CALLBACK);					
+					
+					
+				} catch (ActivityAlreadyExistsException e)
+				{
+					// TODO Auto-generated catch block
+					logger.warn("ActivityAlreadyExistsException!!: ");
+					e.printStackTrace();
+				} catch (NullPointerException e)
+				{
+					// TODO Auto-generated catch block
+					logger.warn("NullPointerException!!: ");
+					e.printStackTrace();
+				} catch (IllegalStateException e)
+				{
+					// TODO Auto-generated catch block
+					logger.warn("IllegalStateException!!: ");
+					e.printStackTrace();
+				} catch (SLEEException e)
+				{
+					// TODO Auto-generated catch block
+					logger.warn("SLEEException!!: ");
+					e.printStackTrace();
+				} catch (StartActivityException e)
+				{
+					// TODO Auto-generated catch block
+					logger.warn("StartActivityException!!: ");
+					e.printStackTrace();
+				} catch (FireEventException e)
+				{
+					// TODO Auto-generated catch block
+					logger.warn("FireEventException!!: ");
+					e.printStackTrace();
+				}
+			}
+			else
+			{
+				callProcessorStats.getCounters().incrementCounter(MessageCounter.RETRANS_INVITE);
+			}
+		}
+		else if ( (serverTransaction != null) && (request.getMethod().equals(Request.ACK)) ) 
+		//		if ( (serverTransaction == null) && !request.getMethod().equals(Request.ACK) )
+		{
+			callProcessorStats.getCounters().incrementCounter(MessageCounter.ACK);
+			String rqCallId = getCallId(request,null);
+			if (rqCallId == null)
+			{
+				logger.warn("Null callId in the request: "+request);
+			}
+			CallLegImpl rqCallLeg = callLegs.get(rqCallId);
+			if (rqCallLeg != null)
+			{	
+				rqCallLeg.getCallActivity().bridgeACK(request);
+				
+				try
+				{
+					serverTransaction.terminate();
+					if(logger.isDebugEnabled())logger.debug("Terminating ACK transaction ");					
+					
+				} catch (ObjectInUseException e)
+				{
+					// TODO Auto-generated catch block
+					logger.error("Could not terminate ACK transaction: ");					
+					e.printStackTrace();
+				}				
+			}
+			else
+			{
+				logger.warn("Unkown callId in this ACK, mmm...very strange...anyway, ignoring!");
+			}
+		}
+		else if ( (serverTransaction != null) && (request.getMethod().equals(Request.BYE)) ) 
+			//		if ( (serverTransaction == null) && !request.getMethod().equals(Request.ACK) )
+			{
+				callProcessorStats.getCounters().incrementCounter(MessageCounter.BYE);
+				String rqCallId = getCallId(request,null);
+				if (rqCallId == null)
+				{
+					logger.warn("Null callId in the request: "+request);
+				}
+				CallLegImpl rqCallLeg = callLegs.get(rqCallId);
+				if (rqCallLeg != null)
+				{	
+					if(logger.isDebugEnabled())logger.debug("Overriding existing server transaction: "+rqCallLeg.getInitialServerTransaction()+" with new one "+serverTransaction);
+					rqCallLeg.setServerTransaction(serverTransaction);
+					rqCallLeg.getCallActivity().bridgeBYE(request);
+					
+				}
+				else
+				{
+					logger.warn("Unkown callId in this BYE, mmm...very strange...anyway, ignoring!");
+				}
+			}		
+		else
+		{
+			callProcessorStats.getCounters().incrementCounter(MessageCounter.OTHER);
+			logger.warn("Out of transaction request. Ignoring. \n" + request.getMethod());
+			//TODO check other possibilities instead of ignoring them
+		}
+		
+	}
+	public void processResponse(ResponseEvent responseEvent)
+	{
+
+		if (logger.isDebugEnabled())
+			logger.debug("Response " + responseEvent.getResponse() + " received at "
+					+ sipStack.getStackName() + " with server transaction id "
+					+ responseEvent.getClientTransaction());
+		callProcessorStats.getCounters().incrementCounter(MessageCounter.RESPONSE);
+		if(logger.isDebugEnabled())logger.debug("Incoming response");
+		ClientTransaction clientTransaction = responseEvent.getClientTransaction();		
+		Dialog dialog = responseEvent.getDialog();
+		if(logger.isDebugEnabled())logger.debug("Dialog: "+dialog);
+		Response response = responseEvent.getResponse();
+		responseEvent.getSource(); //javax.sip.SipProvider		
+		if(clientTransaction != null)
+		{
+			CallLegImpl callLeg = (CallLegImpl)clientTransaction.getApplicationData();
+			CallActivityImpl callActivity = callLeg.getCallActivity();
+			if(logger.isDebugEnabled())logger.debug("AppData: "+callActivity);
+			Response bridgedResponse = (Response)response.clone();
+						
+			CallLeg incomingCallLeg = callActivity.getIncomingCallLeg();
+			Request incomingRequest = incomingCallLeg.getCurrentRequest();
+			CallIdHeader callIdHeader = (CallIdHeader)incomingRequest.getHeader(CallIdHeader.NAME);
+			
+			// basic bridged response tuning:
+			bridgedResponse.setHeader(callIdHeader);
+			bridgedResponse.setHeader(getStackContactHeader());
+			
+			ServerTransaction serverTransaction = incomingCallLeg.getCurrentServerTransaction();		
+			serverTransaction = serverTransaction == null? incomingCallLeg.getInitialServerTransaction():serverTransaction;
+			
+			try
+			{
+				bridgedResponse.removeHeader(Via.NAME);
+				
+				if(logger.isDebugEnabled())logger.debug("Restoring incoming request via headers topmost Via ");
+//				if (viaHeaderList.hasNext())
+//				{
+//					Via via = viaHeaderList.next();
+//					bridgedResponse.addHeader(via);
+//					if(logger.isDebugEnabled())logger.debug("Adding via hader: "+via); 
+//				}		
+		        ViaList vList = new ViaList();
+		        Via via;
+//		        for(ListIterator<Via> viaHeaderList = incomingRequest.getHeaders(Via.NAME); viaHeaderList.hasNext(); vList.add(via))
+		        for(ListIterator<Via> viaHeaderList = serverTransaction.getRequest().getHeaders(Via.NAME); viaHeaderList.hasNext(); vList.add(via))
+		        {
+		            via = (Via)viaHeaderList.next();
+		            if(logger.isDebugEnabled())logger.debug("Adding via hader: "+via); 
+		        }
+		        bridgedResponse.addHeader(vList);
+				
+				if(logger.isDebugEnabled())logger.debug("Trying to send bridged response: "+bridgedResponse+ "\nThrough server transaction "+serverTransaction);
+				serverTransaction.sendResponse(bridgedResponse);
+//				Dialog serverDialog = serverTransaction.getDialog();
+//				if(dialog != null)
+//				{
+//					if(logger.isDebugEnabled())logger.debug("Server dialog: "+serverDialog); 
+//				}
+//				else
+//				{
+//					serverTransaction.terminate();
+//				}
+				//If this was the response for a BYE request, finish activity;
+				String method = clientTransaction.getRequest().getMethod();
+				if(method.equalsIgnoreCase("BYE"))
+				{
+//					if(serverDialog != null)
+//					{
+//						if(logger.isDebugEnabled())logger.debug("Terminating server dialog: "+serverDialog);
+//						
+//					}
+					ra.getEndpoint().endActivity(callActivity.getActivityHandle());
+					CallLegImpl cltoremove = callLegs.remove(callActivity.getIncomingCallId());
+					if(logger.isDebugEnabled())logger.debug("IncomingCallLeg removed: "+cltoremove+" Id: "+callActivity.getIncomingCallId());
+					cltoremove = callLegs.remove(callActivity.getOutgoingCallLeg().getCallId());
+					if(logger.isDebugEnabled())logger.debug("OutgoingCallLeg removed: "+cltoremove+" Id "+callActivity.getOutgoingCallLeg().getCallId());
+					CallActivityImpl catoremove = calls.remove(callActivity.getCallActivityHandle().toString());
+					if(logger.isDebugEnabled())logger.debug("CallActivity released: "+catoremove);
+					callActivity.getOutgoingCallLeg().cleanUp();
+					callActivity.getIncomingCallLeg().cleanUp();
+				}
+						
+			} catch (SipException e)
+			{
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} catch (InvalidArgumentException e)
+			{
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} 
+		}
+		else 
+		{
+			
+			logger.warn("No AppData for this client transaction: "+clientTransaction);
+		}
+
+		
+	}
+
+	/**
+	 * 
+	 */
+	public void processTimeout(TimeoutEvent timeoutEvent)
+	{
+		if(logger.isEnabledFor(Priority.WARN))logger.warn("Timeout " + timeoutEvent + " received at "
+				+ sipStack.getStackName());
+		callProcessorStats.getCounters().incrementCounter(MessageCounter.TIMEOUT);
+		ClientTransaction clientTransaction = timeoutEvent.getClientTransaction();
+		ServerTransaction serverTransaction = timeoutEvent.getServerTransaction();
+		Timeout timeout = timeoutEvent.getTimeout();
+		boolean isServerTransaction = timeoutEvent.isServerTransaction();
+		timeoutEvent.getSource();	 //javax.sip.SipProvider
+		if(logger.isDebugEnabled())logger.debug("CP:notifyTOEvt-SRC: "+timeoutEvent.getSource());
+		if(logger.isDebugEnabled())logger.debug("CP:notifyTOEvt-TO: "+timeout);
+		if(logger.isDebugEnabled())logger.debug("CP:notifyTOEvt-TR: "+(isServerTransaction?serverTransaction:clientTransaction));
+		Dialog dialog = null;
+		if(isServerTransaction)
+		{
+			dialog=serverTransaction.getDialog();
+			if(logger.isDebugEnabled())logger.debug("CP:notifyTOEvt-ST: "+serverTransaction);	
+			if(logger.isDebugEnabled() && serverTransaction != null)logger.debug("CP:notifyTOEvt-ST-DLG: "+dialog);
+			
+		}
+		else
+		{			
+			dialog=clientTransaction.getDialog();
+			if(logger.isDebugEnabled())logger.debug("CP:notifyTOEvt-CST: "+clientTransaction);
+			if(logger.isDebugEnabled() && clientTransaction != null)logger.debug("CP:notifyTOEvt-SDLG: "+dialog);
+		}
+		if (dialog != null)
+		{
+			CallLeg callLeg = (CallLeg)dialog.getApplicationData();
+			if(logger.isDebugEnabled())logger.debug("CP:notifyTOEvt-CallLeg: "+callLeg);
+			if (callLeg != null)
+			{
+				//TODO : process this tOut within the call context
+			}
+		}
+	}
+	
+	public boolean dispatchEgressCallLeg(CallLegImpl ingressCallLeg, CallLegImpl egressCallLeg)
+	{
+		if(logger.isDebugEnabled())logger.debug("Dispatching outgoing request ");
+		if(egressCallLeg != null && egressCallLeg.getCurrentRequest() != null)
+		{
+			getCallProcessorStats().getCounters().incrementCounter(MessageCounter.SERVICE_ACTION);
+			String outgoingCallId = egressCallLeg.getCallId();
+			registerOutgoingCallLeg(outgoingCallId, egressCallLeg);
+			try
+			{
+				
+				ClientTransaction clientTransaction = egressCallLeg.getInitialClientTransaction();//ra.getStackListener().sipProvider.getNewClientTransaction(outgoingCallLeg.getRequest());
+				clientTransaction.setApplicationData(egressCallLeg);
+				clientTransaction.sendRequest();
+				if(logger.isDebugEnabled())logger.debug("Outgoing request dispatched");	
+
+//				try
+//				{
+//					
+//					Response response = ra.getStackListener().messageFactory.createResponse(Response.TRYING, getIncomingCallLeg().getRequest());
+//					getIncomingCallLeg().getInitialServerTransaction().sendResponse(response);
+//					if(logger.isDebugEnabled())logger.debug("CM:notifyRqEvt: 100 Trying sent");
+//				} catch (ParseException e)
+//				{
+//					// TODO Auto-generated catch block
+//					e.printStackTrace();
+//				} catch (SipException e)
+//				{
+//					// TODO Auto-generated catch block
+//					e.printStackTrace();
+//				} catch (InvalidArgumentException e)
+//				{
+//					// TODO Auto-generated catch block
+//					e.printStackTrace();
+//				}				
+				return true;
+			} 
+			catch (TransactionUnavailableException e)
+			{
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} catch (SipException e)
+			{
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+		}
+		if(logger.isDebugEnabled())logger.debug("Error dispatching outgoing request "+(egressCallLeg==null));
+		return false;
+		
+	}	
+	public void registerOutgoingCallLeg(String callId, CallLegImpl outgoingCallLeg)
+	{
+		callLegs.put(callId, outgoingCallLeg);
+	}
+	
+	
+	/////////////// Stack Lifecycle /////////////////
+	/**
+	 * Shutdown
+	 */
+	public void shutdown() throws Exception 
+	{
+		sipStack.stop();
+		sipProvider.removeSipListener(this);
+		sipProvider.removeListeningPoint(lp);
+		sipStack.deleteListeningPoint(lp);
+		sipStack.deleteSipProvider(sipProvider);
+		
+		sipProvider = null;
+		messageFactory = null;
+		headerFactory = null;
+		addressFactory = null;
+		
+		sipStack = null;     
+		
+    	//This way the stack does not remain cached in the factory, thus 
+    	// keeping old properties when the RA is restarted.
+    	// This is to clean up old stacks: how does this work with several entities?
+    	SipFactory sipFactory = SipFactory.getInstance();
+        sipFactory.resetFactory();		
+	} 
+	
+	/**
+	 * Set the state as closing
+	 */
+	public void close() throws Exception
+	{
+		terminationRequested = true;
+	
+	}
+
+	/**
+	 * Init the stack
+	 */
+	public SipStack init(String configFilePath, SimpleNISTResourceAdaptor ra) {
+
+		SipFactory sipFactory = null;
+		sipStack = null;		
+		logger = Logger.getLogger(ra.getRaContext().getEntityName()+".SIPStackListener");		
+		sipFactory = SipFactory.getInstance();
+		sipFactory.setPathName(stackPathName);
+		
+		Properties properties = new Properties();		
+        //try retrieve data from file
+		try 
+		{
+		
+			//			properties.load(new FileInputStream("../etc/cc_stack.properties"));
+			if (logger.isInfoEnabled())logger.info("Loading stack properties file: "+configFilePath);
+			properties.load(new FileInputStream(configFilePath));
+			
+		            
+		}
+		catch(IOException e)
+		{
+			logger.error("Could not find properties file. Using default values");
+			//			e.printStackTrace();
+			properties.setProperty("com.atos.cc.IP_ADDRESS", stackAddress);
+			//en la version 1.2 no sirve
+			//properties.setProperty("javax.sip.RETRANSMISSION_FILTER", "true");
+			properties.setProperty("javax.sip.STACK_NAME", "spe");
+			properties.setProperty("javax.sip.USE_ROUTER_FOR_ALL_URIS", "false");
+			
+			// properties.setProperty("javax.sip.AUTOMATIC_DIALOG_SUPPORT","off");
+			// You need 16 for logging traces. 32 for debug + traces.
+			properties.setProperty("gov.nist.javax.sip.TRACE_LEVEL", ""+stackTraceLevel);
+			properties.setProperty("gov.nist.javax.sip.DEBUG_LOG", stackDebugLog);
+			properties.setProperty("gov.nist.javax.sip.SERVER_LOG", stackServerLog);
+			// Guard against starvation.
+			//properties.setProperty("gov.nist.javax.sip.READ_TIMEOUT", "1000");
+			//properties.setProperty("gov.nist.javax.sip.MAX_MESSAGE_SIZE", "4096");
+			//properties.setProperty("gov.nist.javax.sip.CACHE_SERVER_CONNECTIONS", "false");
+			//properties.setProperty("gov.nist.javax.sip.CACHE_CLIENT_CONNECTIONS", "false");
+			properties.setProperty("gov.nist.javax.sip.REENTRANT_LISTENER", "true");
+			properties.setProperty("gov.nist.javax.sip.THREAD_POOL_SIZE", ""+stackThreads);
+			//properties.setProperty("gov.nist.javax.sip.MAX_CONNECTIONS", "5");			
+			//properties.setProperty("javax.sip.AUTOMATIC_DIALOG_SUPPORT", "off");
+					
+		}		
+		if (logger.isInfoEnabled())logger.info("Stack properties: "+properties.toString());
+
+		try {
+			// Create SipStack object
+			String deprecatedStackAddressParam = properties.getProperty("javax.sip.IP_ADDRESS"); //
+			if (deprecatedStackAddressParam != null)
+			{
+				logger.error("javax.sip.IP_ADDRESS property is no longer valid. Remove it, please, and use com.atos.cc.IP_ADDRESS instead. Ignoring anyway.");				
+				properties.remove("javax.sip.IP_ADDRESS"); //
+			}
+			stackAddress = properties.getProperty("com.atos.cc.IP_ADDRESS");
+			stackTransport = properties.getProperty("com.atos.cc.STACK_TRANSPORT");
+			stackPort = Integer.parseInt(properties.getProperty("com.atos.cc.STACK_PORT"));
+			
+			sipStack = sipFactory.createSipStack(properties);
+			if (logger.isInfoEnabled())logger.info("sipStack = " + sipStack + ", address = "
+					+ stackAddress + ", port = " + stackPort);
+			
+		} catch (Exception e) {
+			e.printStackTrace();
+			logger.error("Exception= " + e.getMessage());
+			if (e.getCause() != null)
+				e.getCause().printStackTrace();
+			return null;
+		}
+
+		try {
+			headerFactory = sipFactory.createHeaderFactory();
+			addressFactory = sipFactory.createAddressFactory();
+			messageFactory = sipFactory.createMessageFactory();
+			lp = sipStack.createListeningPoint(stackAddress, stackPort, stackTransport);			
+
+			sipProvider = sipStack.createSipProvider(lp);
+			sipProvider.addSipListener(this);
+						
+			sipStack.start();
+			
+		} catch (Exception ex) {
+			ex.printStackTrace();
+			logger.error("Exception=" + ex.getMessage());
+			if (ex.getCause() != null)
+				ex.getCause().printStackTrace();
+			return null;
+		}
+		return sipStack;
+	}
+	
+	
+	/////////////// UTILITIEs TO REALLOCATE
+	public static String getCallId(Message msg, Object appData)
+	{
+		CallIdHeader header = (CallIdHeader)msg.getHeader(CallIdHeader.NAME);
+		if (header == null) return null;
+		String callId = header.getCallId(); 
+	
+		if (appData != null)
+			return callId + ':' + appData;
+		else
+			return callId;
+	}
+	public ContactHeader getStackContactHeader()
+	{
+		if (stackContactHeader == null)
+		{
+			try
+			{
+				SipURI contactURI = null;
+				contactURI = addressFactory.createSipURI("NISTStack", stackAddress);
+				contactURI.setPort(stackPort);			
+				Address contactAddress = addressFactory.createAddress(contactURI);
+				contactAddress.setDisplayName("simpleNISTStack");
+				stackContactHeader = headerFactory.createContactHeader(contactAddress);
+	
+			} catch (ParseException e)
+			{
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}	
+		}
+		return stackContactHeader;
+	}
+	public AddressFactory getAddressFactory()
+	{
+		return addressFactory;
+	}
+	public MessageFactory getMessageFactory()
+	{
+		return messageFactory;
+	}
+	public HeaderFactory getHeaderFactory()
+	{
+		return headerFactory;
+	}
+	public SipProvider getSipProvider()
+	{
+		return sipProvider;
+	}
+	public int getStackPort()
+	{
+		return stackPort;
+	}
+	public String getStackAddress()
+	{
+		return stackAddress;
+	}
+	public String getStackRoute()
+	{
+		return stackRoute;
+	}
+	public String getStackTransport()
+	{
+		return stackTransport;
+	}
+	public SipStack getSipStack()
+	{
+		return sipStack;
+	}
+	public SipProvider getIngressSipProvider()
+	{
+		return sipProvider;
+	}
+	public SipProvider getEgressSipProvider()
+	{
+		return sipProvider;
+	}
+	public int getCDRQueueOccupancy()
+	{
+		return ra.getCDRQueueOccupancy();
+	}
+	static AtomicLong sn = new AtomicLong(0);
+	public long incrementAndGetSerialNumber()
+	{
+		return sn.incrementAndGet();
+	}
+	public long getSerialNumber()
+	{
+		return sn.longValue();
+	}	
+	public CallActivity findCallActivity(ActivityHandle handle)
+	{
+		return calls.get(handle.toString());
+	}	
+}

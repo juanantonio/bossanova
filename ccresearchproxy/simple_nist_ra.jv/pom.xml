@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/maven-v4_0_0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.atos.ngin.hec.writer_ra</groupId>
+  <artifactId>simple_nist_ra</artifactId>
+  <name>simple_nist_ra submodule</name>
+
+  <parent>
+  	<artifactId>writer_ra</artifactId>
+  	<groupId>com.atos.ngin.hec</groupId>
+    <version>1.0.0.0-R0-SNAPSHOT</version>
+  </parent>
+  
+  <!-- scm>
+    <connection>scm:svn:svn+ssh://alcaudon/work/projects/svn/hec/modules/trunk/writer_ra/writer_ra.jv/</connection>
+  </scm-->
+
+  <dependencies>
+  	<dependency>
+  		<groupId>com.atos.ngin.hec.extlib</groupId>
+  		<artifactId>slee_jar_2.2-2</artifactId>
+  		<version>4.2.0.0</version>
+  	</dependency>
+  	<dependency>
+  		<groupId>com.atos.ngin.hec.writer_ra</groupId>
+  		<artifactId>simple_nist_lib_jv</artifactId>
+  	</dependency>  	
+  	<dependency>
+  		<groupId>com.atos.ngin.hec.writer_ra</groupId>
+  		<artifactId>simple_nist_ra_type</artifactId>
+  	</dependency>
+    <dependency>
+      <groupId>com.atos.ngin.callcontrol</groupId>
+      <artifactId>jain_sip</artifactId>
+      <version>4.2.0.0</version>
+      <type>jar</type>
+      <scope>compile</scope>
+    </dependency>  	
+  </dependencies>  
+
+</project>
+

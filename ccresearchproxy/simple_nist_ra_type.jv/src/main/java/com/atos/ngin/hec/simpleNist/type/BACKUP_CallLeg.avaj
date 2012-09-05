@@ -1,0 +1,21 @@
+package com.atos.ngin.hec.simpleNist.type;
+
+import javax.sip.ClientTransaction;
+import javax.sip.ServerTransaction;
+import javax.sip.message.Request;
+
+public interface CallLeg
+{
+	public enum CallLegType{INGRESS,EGRESS};
+	public enum CallLegState{IDLE, RQ_RCVD, RQ_SENT, RSP_RCVD, RSP_SENT, ENDED}
+	public CallLegType getType();
+	public CallActivity getCallActivity();
+	public Request getInitialRequest();
+	public Request getCurrentRequest();
+	public String getCallId();
+	public ServerTransaction getInitialServerTransaction();
+	public ServerTransaction getCurrentServerTransaction();
+	public ClientTransaction getInitialClientTransaction();
+	public void cleanUp();
+	
+}
